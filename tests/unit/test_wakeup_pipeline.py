@@ -24,6 +24,7 @@ from astrbot.core.agent.tool_image_cache import tool_image_cache
 from astrbot.core.agent_wakeup import wake_main_agent
 from astrbot.core.astr_agent_runtime import AstrAgentRuntime
 from astrbot.core.astr_agent_runtime import session as native_session
+from astrbot.core.astr_agent_runtime.hooks import MainAgentHooks
 from astrbot.core.astr_agent_runtime.main_agent import MainAgentBuildResult
 from astrbot.core.astr_agent_runtime.main_agent import builder as native_builder
 from astrbot.core.astr_agent_runtime.main_agent.request import prepare_request
@@ -32,18 +33,28 @@ from astrbot.core.config.default import DEFAULT_CONFIG
 from astrbot.core.event_bus import EventBus
 from astrbot.core.log import _log_context
 from astrbot.core.message.message_event_result import MessageChain
+from astrbot.core.pipeline import context_utils
 from astrbot.core.pipeline.context import PipelineContext
 from astrbot.core.pipeline.scheduler import PipelineScheduler
 from astrbot.core.platform.agent_wakeup_event import AgentWakeupEvent
 from astrbot.core.platform.astr_message_event import (
     AstrMessageEvent,
     current_message_event,
+    event_context,
 )
 from astrbot.core.platform.astrbot_message import AstrBotMessage, MessageMember
 from astrbot.core.platform.message_type import MessageType
 from astrbot.core.platform.platform_metadata import PlatformMetadata
 from astrbot.core.provider.entities import LLMResponse
 from astrbot.core.provider.func_tool_manager import FunctionToolManager
+from astrbot.core.star import base as star_base
+from astrbot.core.star.base import Star
+from astrbot.core.star.star import StarMetadata, star_map
+from astrbot.core.star.star_handler import (
+    EventType,
+    StarHandlerMetadata,
+    StarHandlerRegistry,
+)
 from astrbot.core.utils import trace as trace_module
 
 
@@ -71,6 +82,7 @@ async def runtime(monkeypatch):
         gate=asyncio.Event(),
         cleaned=asyncio.Event(),
         requests=[],
+        agent_hooks=BaseAgentRunHooks(),
         events=[],
         deliver=False,
         fail=False,
@@ -179,7 +191,7 @@ async def runtime(monkeypatch):
                 context=SimpleNamespace(event=event, send_to_user=True, _output_turn=None)
             ),
             tool_executor=MagicMock(),
-            agent_hooks=BaseAgentRunHooks(),
+            agent_hooks=control.agent_hooks,
             streaming=config.streaming_response,
         )
         return MainAgentBuildResult(runner, prepared.request, provider)
@@ -612,3 +624,80 @@ async def test_background_output_uses_normal_overflow_and_image_handling(
         event.type == "message.appended" and event.payload["message"]["role"] == "user"
         for event in events
     ) == 1
+
+
+@pytest.mark.asyncio
+async def test_host_checks_continuation_ownership_without_hiding_turns(
+    runtime, monkeypatch
+):
+    """Other plugins can observe managed turns but cannot re-arm them."""
+    registry = StarHandlerRegistry()
+    monkeypatch.setattr(context_utils, "star_handlers_registry", registry)
+    monkeypatch.setattr(star_base, "star_registry", [])
+    runtime.agent_hooks = MainAgentHooks()
+    plugins = {}
+    for name in ("A", "B", "C", "D"):
+        module = f"fixture.continuation.{name}"
+        metadata = StarMetadata(name=name)
+        monkeypatch.setitem(star_map, module, metadata)
+        cls = type(f"Plugin{name}", (Star,), {"__module__": module})
+        plugins[name] = metadata.star_cls = cls(runtime.context)
+
+    attempts = []
+    observations = []
+
+    async def check(event, *_):
+        if event.message_str != "C next":
+            # A child task inherits the host's turn ownership.
+            accepted = await asyncio.create_task(
+                plugins["C"].schedule_continuation("C next")
+            )
+            attempts.append((event.message_str, accepted))
+            if event.message_str == "A":
+                with pytest.raises(PermissionError):
+                    await wake_main_agent(
+                        runtime.context,
+                        umo=event.unified_msg_origin,
+                        user_prompt="Unmanaged bypass",
+                        source="plugin",
+                        source_id="A",
+                    )
+
+    async def observe(event, *_):
+        observations.append(event.message_str)
+
+    for owner, callback in [("C", check), ("D", observe)]:
+        registry.append(
+            StarHandlerMetadata(
+                event_type=EventType.OnAgentDoneEvent,
+                handler_full_name=f"fixture.continuation.{owner}.done",
+                handler_name="done",
+                handler_module_path=f"fixture.continuation.{owner}",
+                handler=callback,
+                event_filters=[],
+            )
+        )
+
+    message = AstrBotMessage()
+    message.type = MessageType.FRIEND_MESSAGE
+    message.self_id = "bot"
+    message.sender = MessageMember(user_id="alice")
+    initial = AstrMessageEvent(
+        "start",
+        message,
+        PlatformMetadata(id="target", name="aiocqhttp", description="Target"),
+        "user",
+    )
+    with event_context(initial):
+        assert await asyncio.gather(
+            *(plugins[name].schedule_continuation(name) for name in ("A", "B", "C"))
+        ) == [True, True, True]
+    await asyncio.wait_for(runtime.drain(), 3)
+
+    assert attempts == [("A", False), ("B", False), ("C", True)]
+    assert observations == ["A", "B", "C", "C next"]
+    assert len(runtime.requests) == 4
+    assert {
+        "role": "assistant",
+        "content": [{"type": "text", "text": "Reply 1"}],
+    } in runtime.requests[1]

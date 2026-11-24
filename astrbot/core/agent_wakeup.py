@@ -4,6 +4,7 @@ import asyncio
 from typing import TYPE_CHECKING
 
 from astrbot.core.platform.agent_wakeup_event import AgentWakeupEvent, WakeupSource
+from astrbot.core.platform.astr_message_event import _continuation_owner
 from astrbot.core.platform.message_session import MessageSession
 from astrbot.core.star.context import Context
 
@@ -44,7 +45,13 @@ async def wake_main_agent(
     Raises:
         ValueError: If the source or target session is invalid,
             or the target platform adapter is unavailable.
+        PermissionError: If a plugin wakeup is submitted from a managed
+            continuation. Use the owning Star's continuation entry point.
     """
+    if source == "plugin" and _continuation_owner.get() is not None:
+        raise PermissionError(
+            "Use Star.schedule_continuation in a managed continuation"
+        )
     if stop_signal is not None and stop_signal.is_set():
         return
     session = MessageSession.from_str(umo)

@@ -41,6 +41,9 @@ from .platform_metadata import PlatformMetadata
 streaming_response_event: ContextVar["AstrMessageEvent | None"] = ContextVar(
     "streaming_response_event", default=None
 )
+_continuation_owner: ContextVar[object | None] = ContextVar(
+    "continuation_owner", default=None
+)
 current_message_event: ContextVar["AstrMessageEvent | None"] = ContextVar(
     "current_message_event", default=None
 )
@@ -64,6 +67,11 @@ def event_context(event: "AstrMessageEvent") -> Iterator[None]:
         return
     event._execution_active = True
     event_token = current_message_event.set(event)
+    owner_token = (
+        _continuation_owner.set(event._continuation_owner)
+        if event._continuation_owner is not None
+        else None
+    )
     active_event_registry.register(event)
     try:
         yield
@@ -76,6 +84,8 @@ def event_context(event: "AstrMessageEvent") -> Iterator[None]:
             finally:
                 event._execution_active = False
                 current_message_event.reset(event_token)
+                if owner_token is not None:
+                    _continuation_owner.reset(owner_token)
 
 
 class AstrMessageEvent(abc.ABC):
@@ -171,6 +181,7 @@ class AstrMessageEvent(abc.ABC):
         # back_compability
         self.platform = platform_meta
         self._execution_active = False
+        self._continuation_owner: object | None = None
 
     @property
     def unified_msg_origin(self) -> str:

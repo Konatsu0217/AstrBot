@@ -63,6 +63,59 @@ class Star(CommandParserMixin, PluginKVStoreMixin):
             star_map[cls.__module__].star_cls_type = cls
             star_map[cls.__module__].module_path = cls.__module__
 
+    async def schedule_continuation(self, user_prompt: str) -> bool:
+        """Enqueue a managed main-agent continuation for the current session.
+
+        A managed continuation can schedule another turn only through the
+        plugin instance that started it. Other plugins can still observe it.
+
+        Args:
+            user_prompt: Model input for the next turn.
+
+        Returns:
+            True when queued, or False when another plugin owns the current
+            continuation.
+
+        Raises:
+            RuntimeError: If invoked without a current event or by an inactive plugin.
+            ValueError: If the target adapter is unavailable or the prompt is empty.
+        """
+        from astrbot.core.platform.agent_wakeup_event import AgentWakeupEvent
+        from astrbot.core.platform.astr_message_event import (
+            _continuation_owner,
+            current_message_event,
+        )
+        from astrbot.core.platform.message_session import MessageSession
+
+        owner = _continuation_owner.get()
+        if owner is not None and owner is not self:
+            return False
+        metadata = star_map.get(type(self).__module__)
+        origin = current_message_event.get()
+        if not metadata or not metadata.activated or metadata.star_cls is not self:
+            raise RuntimeError("Continuation requires an active plugin instance")
+        if origin is None:
+            raise RuntimeError("Continuation requires a current message event")
+        if not user_prompt.strip():
+            raise ValueError("Continuation requires a non-empty prompt")
+        platform = self.context.get_platform_inst(origin.session.platform_id)
+        if platform is None:
+            raise ValueError("Continuation target adapter is unavailable")
+
+        event = AgentWakeupEvent(
+            context=self.context,
+            session=MessageSession.from_str(origin.unified_msg_origin),
+            platform_meta=platform.meta(),
+            prompt=user_prompt,
+            source="plugin",
+            source_id=metadata.name,
+            role=origin.role,
+            source_event=origin,
+        )
+        event._continuation_owner = self
+        await self.context.get_event_queue().put(event)
+        return True
+
     async def text_to_image(
         self,
         text: str,
